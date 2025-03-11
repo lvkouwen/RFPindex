@@ -1,6 +1,6 @@
 This repository contains data and code relating to the study:
 
-An empirically derived riparian forest preference index for lowland stream macroinvertebrates
+### **An empirically derived riparian forest preference index for lowland stream macroinvertebrates** ###
 
 Leon A.H. van Kouwen, Gea H. van der Lee, Michiel H.S. Kraak, Piet F.M. Verdonschotb,
 
