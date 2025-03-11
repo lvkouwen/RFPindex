@@ -1,6 +1,7 @@
 This repository contains data and code relating to the study:
 
 An empirically derived riparian forest preference index for lowland stream macroinvertebrates
+
 Leon A.H. van Kouwen, Gea H. van der Lee, Michiel H.S. Kraak, Piet F.M. Verdonschotb,
 
 E-mail addresses: l.vankouwen@has.nl (L.A.H. van Kouwen), gea.vanderlee@wur.nl (G.H. van der Lee), m.h.s.kraak@uva.nl (M.H.S. Kraak), piet.verdonschot@wur.nl (P.F.M. Verdonschot)
