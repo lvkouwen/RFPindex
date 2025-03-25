@@ -1,0 +1,78 @@
+library(tidyr)
+library(dplyr)
+library(sf)
+library(sp)
+library(geos)
+library(raster)
+library(stats)
+library(terra)
+library(tidyterra)
+library(ggplot2)
+library(units)
+library(data.table)
+
+options("scipen"=100, "digits"=7)
+
+# Load all data
+landuse.nl <- rast("../GIS/LGN/LGN2022.tif")
+landuse.nl.conversion <- read.csv("../GIS/LGN/codes_LGN_adj2.csv")
+elev.total <- rast("../GIS/AHN/AHN4_5m_DTM_RD.tif")
+
+# Loading the buffer shapes 
+ID.loc.buffer <- st_as_sf(vect("./segment shapes/ID.loc.buffer.shp"))
+
+rip.parms <- NULL
+
+# loop to extract data per sampling site and scale
+for (i in unique(ID.loc.buffer$rownum)){ 
+    
+  mafa.streams.section.buff <- ID.loc.buffer %>% subset(ID.loc.buffer$rownum == i)
+  mafa.streams.section.buff.vect <- vect(mafa.streams.section.buff)
+  rip.parms.tmp <- NULL
+  
+  # length
+   rip.parms.tmp$length <- mafa.streams.section.buff %>% 
+      st_as_sf() %>%
+      st_cast("POINT") %>% # turn polygon into points
+      distinct() %>% # remove duplicates
+      st_distance() %>% # calculate distance matrix
+      as.data.frame() %>% 
+      gather(point_id, dist) %>% # convert to long format
+      pull(dist) %>% # keep only distance column
+      as.numeric() %>%
+      max()/1000  %>%
+      unclass()
+   
+   rip.parms.tmp$area <- as.numeric(st_area(mafa.streams.section.buff)/1000^2)
+   
+   # elevation
+   elevation <- terra::extract(elev.total, mafa.streams.section.buff.vect) %>% 
+     summarise(elev.mean=mean(AHN4_5m_DTM_RD, na.rm=T),
+               elev.diff=max(AHN4_5m_DTM_RD, na.rm=T)-min(AHN4_5m_DTM_RD, na.rm=T),
+               elev.sd=sd(AHN4_5m_DTM_RD, na.rm=T))
+   
+   rip.parms.tmp$rownum <- i
+   rip.parms.tmp <- cbind(rip.parms.tmp, elevation) %>% as.data.frame()
+   rip.parms.tmp$elev.slope <- rip.parms.tmp$elev.diff/rip.parms.tmp$length 
+   rip.parms.tmp <- rip.parms.tmp %>% pivot_longer(!rownum, names_to = "parameter", values_to = "value")
+   
+  # land use
+  values <- terra::extract(landuse.nl, mafa.streams.section.buff.vect) %>% 
+    group_by(LGN2022) %>% 
+    summarise(count=sum(ID)) %>%
+    inner_join(landuse.nl.conversion) 
+  values.lu <- values %>% group_by(parameter) %>% summarise(value=sum(count))
+  
+  values.lu$value <- values.lu$value / sum(values.lu$value)
+
+  rip.parms.tmp <- rbind(values.lu, rip.parms.tmp)
+
+  # bind df   
+  rip.parms <- rbind(rip.parms, rip.parms.tmp)
+}
+
+
+# write df
+rip.parms <- rip.parms %>% left_join(ID.loc.buffer, by="rownum") %>% select(-3,-6)
+rm(values)
+fwrite(rip.parms, "rip.parms.csv")
