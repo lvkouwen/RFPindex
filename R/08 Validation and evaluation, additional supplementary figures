@@ -1,0 +1,525 @@
+library(stringr)
+library(ggpmisc)
+library(vegan)
+library(cowplot)
+library(ggrepel)
+library(GGally)
+library(grid)
+library(rcompanion)
+library(MASS)
+library(rstatix)
+library(gridExtra)
+library(patchwork)
+library(beepr)
+library(dplyr)
+library(FSA)
+library(stats)
+library(caret)
+library(data.table)
+library(janitor)
+library(xgboost)
+library(pdp)
+library(ggpubr)
+library(ggplot2)
+library(twn)
+library(tidyr)
+
+options("scipen"=1, "digits"=7)
+
+# load and prepare data
+all.IDs <- fread("mafa.all.IDs.csv") %>% select(-1)
+subsample.IDs <- fread("subsample.IDs.csv")
+abio.all <- fread("rip.parms.trees.csv") 
+names(abio.all)[5] <- "ID.loc"
+abio.all <- abio.all %>% left_join(all.IDs[,c(1,6)])
+
+mafa.ept <- fread("mafa.ept.csv") %>%
+  mutate(Taxon = twn_voorkeurnaam(Taxon),
+         level = twn_taxonlevel(Taxon),
+         ordo = increase_taxonlevel(Taxon, "Ordo"))
+
+Gain_dir.sel.def <- fread(".//Gain_dir.sel.def.csv") %>%
+  mutate(taxon=twn_voorkeurnaam(taxon)) %>%
+  filter(scale==15 & parameter=="nat_for")
+
+model.performance <- fread(".//model.performance_2024-10-30.csv") %>% 
+  filter(scale==15)
+
+Gain_dir.sel.def <- Gain_dir.sel.def %>% 
+  left_join(model.performance[,c(1,5)])
+
+traits <- fread(".//Traits.habitat.csv") %>% 
+  mutate(taxon=twn_voorkeurnaam(Taxon))
+
+traits.saproby <- fread(".//Traits.saproby.csv") %>% 
+  mutate(taxon = twn_voorkeurnaam(Taxon),
+         nl_sap = (nl_xeno*0+nl_oligo*1+nl_beta*2+nl_alpha*3+nl_poly*4)/10)  %>%
+  filter(!is.na(taxon))
+
+traits <- fread(".//Traits.habitat.csv") %>% 
+  mutate(taxon=twn_voorkeurnaam(Taxon))
+
+traits.ctt <- fread(".//CTT.csv") %>% 
+  mutate(taxon=twn_voorkeurnaam(taxon)) %>%
+  filter(!is.na(taxon))
+
+traits <- traits %>% full_join(traits.ctt) %>% full_join(traits.saproby) %>%
+  filter(taxon %in% unique(mafa.ept$Taxon)) 
+
+# calculate index sample values for presence-absence
+mafa.ept.scores <- Gain_dir.sel.def[,c("taxon","RFP","auc_offset")] %>%
+  full_join(traits, by=c("taxon"="Taxon"))
+
+n.spec <- mafa.ept.scores %>% filter(taxon %in% unique(mafa.ept$Taxon)) %>%
+  group_by(taxon) %>%
+  summarise(RFP = RFP,
+            EPT = 1,            ,
+            wood.pom=mean(s.pom+s.woo, na.rm=T),
+            rheo=mean(c.rlp+c.rhp+c.rhb, na.rm = T),
+            sapro=mean(nl_sap, na.rm=T),
+            ctt=mean(CTTt, na.rm = T)) %>% 
+    pivot_longer(names_to = "parameter", cols = 2:8) %>%
+   mutate(value = case_when(value == "NaN" ~ NA,
+                            TRUE ~ value)) %>%
+   group_by(parameter) %>%
+   filter(!is.na(value)) %>%
+   summarise(n = n())
+
+mafa.ept.sitescore.species <- mafa.ept %>% 
+  filter(ID %in% subsample.IDs$ID) %>%
+  filter(year>2009) %>%
+  filter(Waarde>0) %>%
+  left_join(mafa.ept.scores, by=c("Taxon"="taxon")) %>%
+  group_by(ID) %>%
+  summarise(RFP = mean(RFP[auc_offset>=0.7], na.rm=T)
+            EPT = n_distinct(Taxon),
+            wood.pom=mean(s.pom+s.woo, na.rm=T),
+            rheo=mean(sum(c.rlp+c.rhp+c.rhb, na.rm = T)),
+            sapro=mean(nl_sap, na.rm=T),
+            ctt=mean(CTTt, na.rm = T)) %>%
+  left_join(abio.all[,c(2,7)]) %>%
+  filter(!is.na(trees.mean.zero)) %>%
+  mutate(value_bins = case_when(trees.mean.zero<20 ~ "0~20",
+                                trees.mean.zero>=20 & trees.mean.zero <40 ~ "20-40",
+                                trees.mean.zero>=40 & trees.mean.zero <60 ~ "40-60",
+                                trees.mean.zero>=60 & trees.mean.zero <80 ~ "60-80",
+                                trees.mean.zero>=80 ~ "80-100"),
+         value_bins.test = case_when(trees.mean.zero<20 ~ "no1",
+                                     trees.mean.zero>=20 & trees.mean.zero <40 ~ "no2",
+                                     trees.mean.zero>=40 & trees.mean.zero <60 ~ "no3",
+                                     trees.mean.zero>=60 & trees.mean.zero <80 ~ "no4",
+                                     trees.mean.zero>=80 ~ "no5")) %>%
+  pivot_longer(!c(ID, value_bins, value_bins.test, trees.mean.zero), values_to = "score", names_to = "parameter")
+   
+# statistics on presence-absence
+species.kw <- NULL         
+species.dunn <- NULL
+species.dunn.annotate <- NULL
+
+for (parm in unique(mafa.ept.sitescore.species$parameter)){
+  tmp <- mafa.ept.sitescore.species %>% 
+    filter(parameter==parm) %>%
+    na.omit() 
+    
+  species.kw.tmp <- tmp %>% kruskal_test(score~as.factor(value_bins.test)) %>%
+    as.data.frame()
+  species.kw.tmp.eta <- tmp %>% kruskal_effsize(score~as.factor(value_bins.test))
+  
+  species.kw.tmp$parameter <- parm 
+  species.kw.tmp$n.spec <- n.spec$n[n.spec$parameter==parm]
+  
+  species.kw.tmp$n.samples <- species.kw.tmp.eta$n
+  species.kw.tmp$H <- species.kw.tmp.eta$effsize
+  species.kw.tmp$magnitude <- species.kw.tmp.eta$magnitude
+
+  species.dunn.tmp <- tmp %>% dunnTest(score~as.factor(value_bins.test), data=., method="holm")
+  
+  species.dunn.annotate.tmp1 <- species.dunn.tmp$res %>% 
+    cldList(P.unadj~Comparison, data = ., Letters = LETTERS) %>% 
+    as.data.frame()
+  names(species.dunn.annotate.tmp1) <- c("value_bins.test", "Letter_Punadj", "MonoLetter_Punadj")
+  
+  species.dunn.annotate.tmp2 <- species.dunn.tmp$res %>% 
+    cldList(P.adj~Comparison, data = ., Letters = LETTERS) %>% 
+    as.data.frame()
+  names(species.dunn.annotate.tmp2) <- c("value_bins.test", "Letter_Padj", "MonoLetter_Padj")
+  
+  species.dunn.annotate.tmp <- species.dunn.annotate.tmp1 %>% left_join(species.dunn.annotate.tmp2)
+  species.dunn.annotate.tmp$parameter <- parm
+  species.dunn.annotate.tmp <- species.dunn.annotate.tmp %>% 
+    left_join(unique(tmp[,c(3,4)]), by="value_bins.test")
+  
+  species.dunn.annotate <- rbind(species.dunn.annotate, species.dunn.annotate.tmp)
+  
+  species.dunn.tmp <- species.dunn.tmp$res %>% as.data.frame()
+  species.dunn.tmp$parameter <- parm
+  species.dunn <- rbind(species.dunn, species.dunn.tmp) 
+  species.kw <- rbind(species.kw, species.kw.tmp)
+  
+  rm(tmp, species.dunn.annotate.tmp, species.dunn.annotate.tmp1, species.dunn.annotate.tmp2, 
+     species.kw.tmp, species.kw.tmp.eta)
+}
+
+species.max.score <- mafa.ept.sitescore.species %>% 
+  group_by(parameter) %>%
+  summarise(max.score = max(score, na.rm = T))
+  
+species.dunn.annotate <- species.dunn.annotate %>% left_join(species.max.score, by="parameter")
+
+# calculate index sample values for abundance
+mafa.ept.sitescore.abundance <- mafa.ept %>% 
+  filter(ID %in% subsample.IDs$ID) %>%
+  filter(year > 2009) %>%
+  filter(Waarde > 0) %>%
+  left_join(mafa.ept.scores, by = c("Taxon" = "taxon")) %>%
+  group_by(ID) %>%
+  summarise(RFP = weighted.mean(RFP[auc_offset>=0.7], log10(Waarde[auc_offset>=0.7] + 1), na.rm = TRUE),
+            EPT = sum(log10(Waarde+1)),
+            wood.pom = sum(weighted.mean(s.pom, log10(Waarde + 1), na.rm = TRUE) +
+                             weighted.mean(s.woo, log10(Waarde + 1), na.rm = TRUE), na.rm = TRUE),
+            rheo = sum(weighted.mean(c.rlp, log10(Waarde + 1), na.rm = TRUE) +
+                         weighted.mean(c.rhp, log10(Waarde + 1), na.rm = TRUE) +
+                         weighted.mean(c.rhb, log10(Waarde + 1), na.rm = TRUE), na.rm = TRUE),
+            sapro=weighted.mean(nl_sap, log10(Waarde + 1), na.rm=T),
+            ctt=weighted.mean(CTTt, log10(Waarde+1), na.rm = T)) %>%
+  left_join(abio.all[,c(2,7)]) %>%
+  filter(!is.na(trees.mean.zero)) %>%
+  mutate(value_bins = case_when(trees.mean.zero<20 ~ "0-20",
+                                trees.mean.zero>=20 & trees.mean.zero <40 ~ "20-40",
+                                trees.mean.zero>=40 & trees.mean.zero <60 ~ "40-60",
+                                trees.mean.zero>=60 & trees.mean.zero <80 ~ "60-80",
+                                trees.mean.zero>=80 ~ "80-100"),
+         value_bins.test = case_when(trees.mean.zero<20 ~ "no1",
+                                     trees.mean.zero>=20 & trees.mean.zero <40 ~ "no2",
+                                     trees.mean.zero>=40 & trees.mean.zero <60 ~ "no3",
+                                     trees.mean.zero>=60 & trees.mean.zero <80 ~ "no4",
+                                     trees.mean.zero>=80 ~ "no5")) %>%
+  pivot_longer(!c(ID, value_bins, value_bins.test, trees.mean.zero), values_to = "score", names_to = "parameter")
+
+
+# statistics on abundance
+abundance.kw <- NULL         
+abundance.dunn <- NULL
+abundance.dunn.annotate <- NULL
+
+for (parm in unique(mafa.ept.sitescore.abundance$parameter)){
+  tmp <- mafa.ept.sitescore.abundance %>% 
+    filter(parameter==parm) %>%
+    na.omit()
+    
+  abundance.kw.tmp <- tmp %>% kruskal_test(score~as.factor(value_bins.test)) %>%
+    as.data.frame()
+  abundance.kw.tmp.eta <- tmp %>% kruskal_effsize(score~as.factor(value_bins.test))
+  
+  abundance.kw.tmp$parameter <- parm
+  abundance.kw.tmp$n.spec <- n.spec$n[n.spec$parameter==parm]
+  
+  abundance.kw.tmp$n.samples <- abundance.kw.tmp.eta$n
+  abundance.kw.tmp$H <- abundance.kw.tmp.eta$effsize
+  abundance.kw.tmp$magnitude <- abundance.kw.tmp.eta$magnitude
+  
+  abundance.dunn.tmp <- tmp %>% dunnTest(score~as.factor(value_bins.test), data=., method="holm")
+  abundance.dunn.tmp$parameter <- parm
+  
+  abundance.dunn.annotate.tmp1 <- abundance.dunn.tmp$res %>% 
+    cldList(P.unadj~Comparison, data = ., Letters = LETTERS) %>% 
+    as.data.frame()
+  names(abundance.dunn.annotate.tmp1) <- c("value_bins.test", "Letter_Punadj", "MonoLetter_Punadj")
+  
+  abundance.dunn.annotate.tmp2 <- abundance.dunn.tmp$res %>% 
+    cldList(P.adj~Comparison, data = ., Letters = LETTERS) %>% 
+    as.data.frame()
+  names(abundance.dunn.annotate.tmp2) <- c("value_bins.test", "Letter_Padj", "MonoLetter_Padj")
+  
+  abundance.dunn.annotate.tmp <- abundance.dunn.annotate.tmp1 %>% left_join(abundance.dunn.annotate.tmp2)
+  abundance.dunn.annotate.tmp$parameter <- parm
+  abundance.dunn.annotate.tmp <- abundance.dunn.annotate.tmp %>% 
+    left_join(unique(tmp[,c(3,4)]), by="value_bins.test")
+  
+  abundance.dunn.annotate <- rbind(abundance.dunn.annotate, abundance.dunn.annotate.tmp)
+  
+  abundance.dunn.tmp <- abundance.dunn.tmp$res %>% as.data.frame()
+  abundance.dunn.tmp$parameter <- parm
+  
+  abundance.dunn <- rbind(abundance.dunn, abundance.dunn.tmp) 
+  abundance.kw <- rbind(abundance.kw, abundance.kw.tmp)
+
+  rm(tmp, abundance.dunn.annotate.tmp, abundance.dunn.annotate.tmp1, abundance.dunn.annotate.tmp2, 
+     abundance.kw.tmp, abundance.kw.tmp.eta)
+}
+
+abundance.max.score <- mafa.ept.sitescore.abundance %>% 
+  group_by(parameter) %>%
+  summarise(max.score = max(score, na.rm = T))
+
+abundance.dunn.annotate <- abundance.dunn.annotate %>% left_join(abundance.max.score, by="parameter")  
+
+# plot labels 
+labels.species <- c("RFP"="a) Riparian forest preference\n(RFP)",
+                    "ctt"="c) Central temperature\ntendency (CTT)",
+                    "wood.pom"="e) Preference for organic\ndebris (ORG)",
+                    "sapro"="g) Saprobic classification\n(SAP)",
+                    "EPT"="i) Ephemeroptera, Plecoptera,\nand Trichoptera (EPT)",
+                    "rheo"="Limnorheo-rheobiont",
+                    "RFP.full"="Forest Preference Index (RFP) complete")
+                    
+                    
+labels.abundance <- c("RFP"="b) Riparian forest preference\n(RFP)",
+                      "ctt"="d) Central temperature\ntendency (CTT)",
+                      "wood.pom"="f) Preference for organic\ndebris (ORG)",
+                      "sapro"="h) Saprobic classification\n(SAP)",
+                      "EPT"="j) Ephemeroptera, Plecoptera,\nand Trichoptera (EPT)",
+                      "rheo"="Limnorheo-rheobiont",
+                      "RFP.full"="Forest Preference Index (RFP) complete")
+
+# plot
+skip.parms <- c("RFP.full", "rheo")
+
+counts <- mafa.ept.sitescore.species %>%
+  group_by(value_bins, parameter) %>%
+  summarise(n = n())
+
+plot.species <- mafa.ept.sitescore.species %>% 
+  filter(!parameter %in% skip.parms) %>%
+  ggplot(aes(x=value_bins, y=score))+
+  stat_boxplot(geom = "errorbar",
+               width = 0.15) +
+  geom_boxplot(fill="white", outlier.color="grey", outlier.size = .5)+
+  geom_text(data = species.dunn.annotate[!species.dunn.annotate$parameter %in% skip.parms,], 
+            aes(x=value_bins, y=1.05*max.score,
+                label=Letter_Padj), size=2, fontface="bold")+
+  ggtitle(label="Species presence")+
+  theme(plot.title = element_text(hjust = 0.5, size=7),
+        text = element_text(size=7, face="bold"),
+        axis.text.x=element_text(hjust=1,  vjust=.5, color="black", angle = 90),
+        axis.text.y=element_text(hjust=.8,  color="black"),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "none",
+        axis.ticks = element_line(linewidth = .2, color="grey"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=.05),
+        strip.background = element_rect(color="black", fill=NA, linewidth=.05, linetype="solid"),
+        strip.text = element_text(margin = margin(t = 1, r = 1, b = 1, l = 1)),
+        strip.text.x = element_text(colour = "black", face="bold"),
+        strip.text.y = element_text(colour = "black", face="bold", size=3),
+        plot.margin = margin(2,3,0,2, "mm"))+
+  facet_wrap(~factor(parameter, levels = names(labels.species)), scale="free_y", ncol = 1, 
+             labeller = as_labeller(labels.species))
+
+plot.abundance <- mafa.ept.sitescore.abundance %>% 
+  filter(!parameter %in% skip.parms) %>%
+  ggplot(aes(x=value_bins, y=score))+
+  stat_boxplot(geom = "errorbar",
+               width = 0.15) +
+  geom_boxplot(fill="white", outlier.color="grey", outlier.size = .5)+
+  geom_text(data = abundance.dunn.annotate[!abundance.dunn.annotate$parameter %in% skip.parms,], 
+            aes(x=value_bins, y=1.05*max.score,
+                label=Letter_Padj), size=2, fontface="bold")+
+  ggtitle(label="Weighted abundance")+
+  theme(plot.title = element_text(hjust = 0.5, size=7), 
+        text = element_text(size=7, face="bold"),
+        axis.text.x=element_text(hjust=1,  vjust=.5, color="black", angle = 90),
+        axis.text.y=element_text(hjust=.8,  color="black"),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "none",
+        axis.ticks = element_line(linewidth = .2, color="grey"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=.05),
+        strip.background = element_rect(color="black", fill=NA, linewidth=.05, linetype="solid"),
+        strip.text = element_text(margin = margin(t = 1, r = 1, b = 1, l = 1)),
+        strip.text.x = element_text(colour = "black", face="bold"),
+        strip.text.y = element_text(colour = "black", face="bold", size=3),
+        plot.margin = margin(2,3,0,2, "mm"))+
+  facet_wrap(~factor(parameter, levels = names(labels.abundance)), scale="free_y", ncol = 1, 
+             labeller = as_labeller(labels.abundance))
+
+
+x_title_grob <- grid::textGrob("Forest cover at 15 m around the stream segment (%)", gp=grid::gpar(fontsize=7, fontface="bold"),
+                               x=0.55)
+y_title_grob <- textGrob("Index value", rot = 90, gp=gpar(fontsize=7, fontface="bold"))
+
+combined_plot <- ggarrange(plot.species, plot.abundance, ncol=2, widths = c(1,1))
+  # draw_plot_label(c("a)", "b)"), x=c(-.05, -.05), y=c(.95, 0.715), size=8)
+
+final_plot <- grid.arrange(
+  arrangeGrob(y_title_grob, combined_plot, ncol = 2, widths = c(1, 20)),
+  x_title_grob, 
+  nrow = 2, heights = c(10, .5)
+)
+
+grid.draw(final_plot)
+
+ggsave("Fig.5.cross_validation_evaluation.pdf", plot=final_plot, width = 90, height = 163.6, units = "mm", dpi=1000)  
+
+# Tables for in MS
+names(abundance.kw) <- paste0("abd.", names(abundance.kw))
+
+Index.evaluation <- species.kw[,c(7,8,9,5,10,3,11)] %>% 
+  left_join(abundance.kw[,c(7,5,10,3,11)], by=c("parameter"="abd.parameter"))
+
+fwrite(Index.evaluation, "Index.evaluation.csv")
+
+```
+
+```{r some code to calculate basic stats ms, echo=F, cache=FALSE}
+
+counts <- mafa.ept.sitescore.species %>%
+  group_by(value_bins, parameter) %>%
+  summarise(n = n())
+counts
+
+
+mafa.ept.sitescore.abundance %>% 
+  filter(parameter=="RFP") %>%
+  group_by(value_bins) %>% 
+  summarize(total=length(unique(ID))) %>%
+  mutate(totalperc = 100*total/sum(total))
+
+mafa.ept %>% 
+  filter(ID %in% subsample.IDs$ID) %>%
+  filter(year>2009) %>%
+  filter(Waarde>0) %>% 
+  left_join(mafa.ept.scores, by=c("Taxon"="taxon")) %>%
+  summarise(RFP = length(unique(Taxon[!is.na(RFP)])),
+            EPT = length(unique(Taxon)),
+            wood.pom = length(unique(Taxon[!is.na(s.woo)])),
+            rheo = length(unique(Taxon[!is.na(c.rlp)])),
+            cct = length(unique(Taxon[!is.na(CTTt)])))
+
+Index.evaluation.stats <- mafa.ept.sitescore.species %>%
+  group_by(parameter, value_bins) %>%
+  summarize(sp.mean = mean(score, na.rm = T),
+            sp.median = median(score, na.rm = T),
+            sp.min = min(score, na.rm=T),
+            sp.max = max(score, na.rm=T),
+            sp.sd = sd(score, na.rm=T),
+            sp.countval = length(score[!score=="NaN"])) %>%
+  ungroup() %>%
+  left_join(
+  mafa.ept.sitescore.abundance %>%
+    ungroup() %>%
+    group_by(parameter, value_bins) %>%
+    summarize(abd.mean = mean(score, na.rm = T),
+            abd.median = median(score, na.rm = T),
+            abd.min = min(score, na.rm=T),
+            abd.max = max(score, na.rm=T),
+            abd.sd = sd(score, na.rm=T),
+            abd.countval = length(score[!score=="NaN"])) %>%
+    ungroup())
+
+fwrite(Index.evaluation.stats, "Index.evaluation.stats.csv")
+
+
+# r regression trees-forest supplementary figure
+
+abio.all.lgn <- fread("abio.all.csv") %>% 
+  filter(scale==15 & parameter=="nat.for") %>%
+  filter(ID %in% subsample.IDs$ID)
+
+length(unique(abio.all.lgn$ID))
+
+forest.plot.val <- abio.all.lgn %>% left_join(abio.all, by="ID") %>%
+  ggplot(aes(y = value*100, x = trees.mean.zero)) +
+  geom_point(color = "grey", size=.5) +  
+  geom_smooth(method="lm", formula=y~x-1, se=F, color="black") +
+  stat_poly_eq(parse = TRUE, aes(label = after_stat(rr.label)), formula = y ~ x-1, size = 2, face = "bold") +
+  ggtitle("b) Validation and evaluation samples") +
+  scale_x_continuous(expand=c(0,0))+
+  scale_y_continuous(expand=c(0,0))+
+  theme(plot.title = element_text(hjust = 0.5, size=7),
+        text = element_text(size=7, face="bold"),
+        axis.text =element_text(hjust=.8,  color="black"),
+        legend.position = "none",
+        axis.ticks.x = element_blank(),
+        axis.ticks.y = element_line(linewidth = .2, color="grey"),
+        panel.background = element_rect(fill="white"),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=.05),
+        strip.background = element_rect(color="black", fill=NA, linewidth=.05, linetype="solid"),
+        strip.text.x = element_text(colour = "black", face="bold"),
+        strip.text.y = element_text(colour = "black", face="bold", size=3),
+        plot.margin = margin(0,2,2,0, "mm"))+
+  labs(x = "Tree cover from the tree database of the Netherlands (%)", y = "Forest cover from land use (%)")
+
+abio.all.lgn <- fread("abio.all.csv") %>% 
+  filter(scale==15 & parameter=="nat.for") %>%
+  select(-1) %>%
+  unique
+
+length(unique(abio.all.lgn$ID.loc))
+
+forest.plot.val.loc <- abio.all.lgn %>% 
+  left_join(abio.all, by="ID.loc") %>%
+  ggplot(aes(y = value*100, x = trees.mean.zero)) +
+  geom_point(color = "grey", size=.5) +  
+  geom_smooth(method="lm", formula=y~x-1, se=F, color="black") +
+  stat_poly_eq(parse = TRUE, aes(label = after_stat(rr.label)), formula = y ~ x-1, size = 2, face = "bold") +
+  ggtitle("a) Sampling sites")+
+  scale_x_continuous(expand=c(0,0))+
+  scale_y_continuous(expand=c(0,0))+
+  theme(plot.title = element_text(hjust = 0.5, size=7),
+        text = element_text(size=7, face="bold"),
+        axis.text =element_text(hjust=.8,  color="black"),
+        legend.position = "none",
+        axis.ticks.x = element_blank(),
+        axis.ticks.y = element_line(linewidth = .2, color="grey"),
+        panel.background = element_rect(fill="white"),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=.05),
+        strip.background = element_rect(color="black", fill=NA, linewidth=.05, linetype="solid"),
+        strip.text.x = element_text(colour = "black", face="bold"),
+        strip.text.y = element_text(colour = "black", face="bold", size=3),
+        plot.margin = margin(0,2,2,0, "mm"))+
+  labs(x = "Tree cover from the tree database of the Netherlands (%)", y = "Forest cover from land use (%)")
+
+# plot and save
+ggarrange(forest.plot.val.loc, forest.plot.val)
+ggsave("Fig.sup.forest.vs.trees.pdf", width = 163.6, height = 90, units = "mm", dpi=1000) 
+ggsave("Fig.sup.forest.vs.trees.png", width = 163.6, height = 90, units = "mm", dpi=1000) 
+
+# Supplementary correlation matrix
+abio.all.loc <- fread("..//02 samenvoegen//abio.all.csv") %>% 
+  filter(parameter=="nat.for") %>%
+  filter(scale<501) %>%
+  select(-ID) %>%
+  unique() %>%
+  pivot_wider(id_cols = "ID.loc", names_from = scale, values_from = value)
+
+my_fn <- function(data, mapping, col="black", lwd=.2, method="lm", ...){
+      p <- ggplot(data = data, mapping = mapping) + 
+      geom_point(color="grey", size=.2) + 
+      geom_smooth(method=method, colour=col, linewidth=lwd)
+      p
+    }
+
+colnames(abio.all.loc)[2:ncol(abio.all.loc)] <- paste0(colnames(abio.all.loc)[2:ncol(abio.all.loc)], " m")
+abio.all.loc[,2:ncol(abio.all.loc)] <- abio.all.loc[,2:ncol(abio.all.loc)]*100
+
+abio.all.loc[,2:ncol(abio.all.loc)] %>% 
+  ggpairs(
+    lower = list(continuous = my_fn),
+    upper = list(continuous = wrap("cor", size = 3))  # Smaller R² text
+  ) +
+  labs(x="Forest cover (%)", y="Forest cover (%)")+
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 5),
+    text = element_text(size = 7, face = "bold"),
+    axis.text = element_text(hjust = .8, color = "black"),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    legend.position = "none",
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_line(linewidth = .2, color = "grey"),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = .05),
+    strip.background = element_rect(color = "black", fill = NA, linewidth = .05, linetype = "solid"),
+    strip.text.x = element_text(colour = "black"),
+    strip.text.y = element_text(colour = "black"),
+    plot.margin = margin(0, 2, 2, 0, "mm")
+  )
+
+
+ggsave("Fig.sup.scales.correlation.pdf", width = 163.6, height = 163.6, units = "mm", dpi=1000) 
+ggsave("Fig.sup.scales.correlation.png", width = 163.6, height = 163.6, units = "mm", dpi=1000) 
+
+```
+
