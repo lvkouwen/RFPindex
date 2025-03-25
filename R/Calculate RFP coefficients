@@ -1,0 +1,135 @@
+library(MASS)
+library(janitor)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(data.table)
+library(twn)
+library(segmented)
+library(ggridges)
+
+# constants and dfs
+options("scipen"=100, "digits"=7)
+
+s <- "15"
+p <- "nat_for"
+m <- "offset"
+
+# load dataframes
+model.performance <- fread(paste0(".//data in//model.performance.csv"))
+model.performance.relimp <- fread(paste0(".//data in//model.performance.relimp.csv"))
+model.performance.pdp <- fread(paste0(".//data in//model.performance.pdp.csv"))
+
+model.performance.pdp <- model.performance.pdp %>% 
+  filter(model_type == m"offset")
+
+# calculate gain direction and do LMs for response intensity and cover threshold
+model.performance.pdp <- model.performance.pdp %>% 
+  filter(model_type == m) 
+
+sum.yhat <- 
+  model.performance.pdp %>% 
+    group_by(taxon, parameter, model_type, scale) %>% 
+    summarise(max.yhat.prob = max(yhat.prob)) %>%
+    group_by(taxon, scale, model_type) %>%
+    summarise(sum.yhat.prob = sum(max.yhat.prob))
+
+model.performance.pdp <- model.performance.pdp %>% 
+  left_join(sum.yhat, by=c("taxon", "scale", "model_type")) %>%
+  mutate(yhat.prob = yhat.prob/sum.yhat.prob) %>%
+  select(-sum.yhat.prob)
+
+Gain_dir <- NULL
+
+for (t in unique(model.performance.pdp$taxon))  {
+  for (s in unique(model.performance.pdp$scale)) {
+    for (p in unique(model.performance.pdp$parameter)) {
+      for (m in unique(model.performance.pdp$model_type)) {
+        
+        rm(tmp.lm, tmp.lm.summary, tmp.lm.segs, yhatpred, tmp, tmp.rlm, tmp.rlm.summary)
+        
+        tmp <- model.performance.pdp %>% 
+          filter(taxon == t & scale == s & parameter==p & model_type==m)
+        
+        Gain_dir_tmp <- NULL
+        
+        if(nrow(tmp)>0) {  
+          tmp.lm <- lm(yhat.prob~value, data=tmp)
+          tmp.lm.summary <- summary(tmp.lm) # forest response intensity
+                    
+          Gain_dir_tmp$parameter <- p
+          Gain_dir_tmp$scale <- s
+          Gain_dir_tmp$taxon <- t
+          Gain_dir_tmp$model_type <- m
+          Gain_dir_tmp$tot.estimate <- as.numeric(tmp.lm.summary$coefficients[2,1])
+          Gain_dir_tmp$tot.pval <- as.numeric(tmp.lm.summary$coefficients[8.1])
+          Gain_dir_tmp$tot.yhat.prob.dif <- max(tmp$yhat.prob)-min(tmp$yhat.prob)
+          Gain_dir_tmp$tot.yhat.prob.median.tot <- median(tmp$yhat.prob)
+          Gain_dir_tmp$tot.yhat.prob.mean.tot <- mean(tmp$yhat.prob)
+          Gain_dir_tmp$tot.yhat.prob.min <- min(tmp$yhat.prob)
+          Gain_dir_tmp$tot.yhat.prob.max <- max(tmp$yhat.prob)
+          Gain_dir_tmp$tot.value.dif <- max(tmp$value) - min(tmp$value)
+          Gain_dir_tmp$tot.value.median.tot <- median(tmp$value)
+          Gain_dir_tmp$tot.value.mean.tot <- mean(tmp$value)
+          Gain_dir_tmp$tot.value.min <- min(tmp$value)
+          Gain_dir_tmp$tot.value.max <- max(tmp$value)
+          
+          Gain_dir_tmp <- Gain_dir_tmp %>% as.data.frame()
+          
+          tmp.lm.segs <-selgmented(tmp.lm, Kmax=1,type='bic',plot.ic=F,check.dslope=T) # forest cover threshold
+          
+          tmp.lm.segs.summary <- summary(tmp.lm.segs)
+                     }
+          Gain_dir <- rbind(Gain_dir, Gain_dir_tmp) %>% as.data.frame()
+        }}}}
+
+
+# calculate saturation points and transform yhat}
+model.performance.pdp_summary <- model.performance.pdp %>%
+  group_by(parameter, scale, taxon, model_type) %>%
+  summarize(
+    value_min_yhat = value[which.min(yhat)],  
+    value_max_yhat = value[which.max(yhat)]   
+  )
+
+
+Gain_dir <- Gain_dir  %>%
+  left_join(model.performance.pdp_summary, by = c("parameter", "scale", "taxon", "model_type")) %>%
+  mutate(
+    # Forest cover thresholds (bp.sat)
+    bp.sat = case_when(
+      # Case 1: No cover threshold value -> max if positive tot.estimate, min if negative
+      is.na(bp1.value) & tot.estimate >= 0 ~ value_max_yhat,
+      is.na(bp1.value) & tot.estimate < 0 ~ value_min_yhat,
+
+      # Default: Keep bp1.value
+      TRUE ~ bp1.value
+    ),
+    
+    # Make bp.sat negative if tot.estimate is negative
+    bp.sat = ifelse(tot.estimate < 0, -abs(bp.sat), bp.sat)
+  )
+
+# Filter Gain dfs
+
+Gain_dir.sel.def <- Gain_dir %>%
+  filter(scale < scale.limit) %>%
+  filter(parameter=="nat_for") %>%
+  left_join(filter(model.performance, scale==s), by=c("taxon","scale")) %>%
+  filter(auc_offset>.7)
+
+# calculate RFP
+Gain_dir.sel.def <- Gain_dir.sel.def %>%
+  mutate(
+    direction = case_when(
+      tot.estimate < 0 ~ -1,
+      TRUE ~ 1
+    ),
+    tot.estimate.scaled = abs(tot.estimate) / max(abs(tot.estimate), na.rm = TRUE),
+    bp.sat.scaled = abs(bp.sat) / max(abs(bp.sat), na.rm = TRUE),
+    RFP = (tot.estimate.scaled + bp.sat.scaled) / 2 * direction
+  )
+
+
+fwrite(Gain_dir.sel.def, "Gain_dir.sel.def.csv")
