@@ -1,0 +1,55 @@
+library(tidyr)
+library(dplyr)
+library(sf)
+library(sp)
+library(geos)
+library(raster)
+library(stats)
+library(terra)
+library(tidyterra)
+library(GGally)
+library(ggplot2)
+library(units)
+library(data.table)
+
+options("scipen"=100, "digits"=7)
+
+# Load all data
+trees <- rast("rivm_20231221_bomenkaart_2022.tif") # load tree layer
+ID.loc.buffer <- st_as_sf(vect("./segment shapes/ID.loc.buffer.shp"))
+ID.loc.buffer <- ID.loc.buffer %>% filter(scale==15)
+
+# replace NA with 0
+trees.zero <- trees 
+trees.zero[is.na(trees.zero)] <- 0
+
+rip.parms.trees <- NULL
+
+for (i in unique(ID.loc.buffer$rownum)){
+  
+  mafa.streams.section.buff <- ID.loc.buffer %>% subset(ID.loc.buffer$rownum == i)
+  mafa.streams.section.buff.vect <- vect(mafa.streams.section.buff)
+  
+   trees.tmp <- terra::extract(trees, mafa.streams.section.buff.vect) %>% 
+     summarise(trees.mean=mean(rivm_20231221_bomenkaart_2022, na.rm=T)) 
+   
+   trees.median.tmp <- terra::extract(trees, mafa.streams.section.buff.vect) %>% 
+     summarise(trees.median=median(rivm_20231221_bomenkaart_2022, na.rm=T)) 
+     
+   trees.zero.tmp <- terra::extract(trees.zero, mafa.streams.section.buff.vect) %>% 
+     summarise(trees.mean.zero=mean(rivm_20231221_bomenkaart_2022, na.rm=T)) 
+
+   trees.zero.median.tmp <- terra::extract(trees.zero, mafa.streams.section.buff.vect) %>% 
+     summarise(trees.median.zero=median(rivm_20231221_bomenkaart_2022, na.rm=T)) 
+   
+   trees.tmp <- cbind(trees.tmp, trees.zero.tmp, trees.zero.median.tmp, trees.median.tmp)
+   trees.tmp$rownum <- i
+   
+   #trees.tmp <- trees.tmp %>% pivot_longer(!rownum, names_to = "parameter", values_to = "value")
+   
+  rip.parms.trees <- bind_rows(rip.parms.trees, trees.tmp)
+}
+
+rip.parms.trees <- rip.parms.trees %>% left_join(ID.loc.buffer, by="rownum") %>% select(-5,-8)
+
+fwrite(rip.parms.trees, "rip.parms.trees.csv")
