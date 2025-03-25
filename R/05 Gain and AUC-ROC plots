@@ -1,0 +1,258 @@
+library(lme4)
+library(lmerTest)
+library(lmtest)
+library(cowplot)
+library(rcompanion)
+library(tidyr)
+library(stringr)
+library(rstatix)
+library(FSA)
+library(stats)
+library(ggpubr)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(forcats)
+library(data.table)
+library(twn)
+library(emmeans)
+library(ggplot.multistats)
+
+options("scipen"=100, "digits"=7)
+
+# settings and parameters
+labels_for_plot <- c("1" = "15", "2"="25", "3"="50", "4" = "75", "5"="100", "6"= "150", "7" = "250", "8"="500")
+parm.names <- c("nat_for", "nat_shrub_grass",
+               "agri_grass", "agri_cult", "urban")
+parm.names <- cbind(parm.names, as.factor(c(1,2,3,4,5))) %>% as.data.frame()
+parm.names <- cbind(parm.names, c("Forest", "Low vegetation","Agricultural grassland", "Agricultural cropland", "Urban area"), c("Forest", "Low\nvegetation","Agricultural\ngrassland", "Agricultural\ncropland", "Urban area"))
+names(parm.names) <- c("Feature", "Feature.tmp", "Feature.full", "Feature.short")
+
+# load data
+model.performance <- fread(paste0("./data in/model.performance.csv"))
+model.performance.relimp <- fread(paste0("./data in/model.performance.relimp.csv"))
+model.performance.pdp <- fread(paste0("./data in/model.performance.pdp.csv"))
+
+# select reliable models
+model.performance.sel <- model.performance %>% filter(auc_offset>=0.7)
+model.performance.relimp.sel <- model.performance.relimp %>%
+  filter(paste0(taxon, scale) %in% paste0(model.performance.sel$taxon, model.performance.sel$scale)) %>%
+  filter(model_type == "offset")
+model.performance.relimp.sel$orde <- increase_taxonlevel(model.performance.relimp.sel$taxon, taxonleve = "Ordo")
+
+model.performance$scale <-  fct_relevel(as.character(model.performance$scale), "15","25","50","75","100","150","250","500")
+
+# AUC-ROC scale plot (Supplementary Data F)
+model.performance %>%
+  filter(!grepl("rel", model_type)) %>% 
+  ggplot(aes(x = scale, y = value)) +
+  stat_boxplot(geom = "errorbar",
+               width = 0.15) +
+  geom_boxplot(outlier.colour = "grey", outlier.shape = 16, na.rm = TRUE, fill = "white",
+                                           outlier.size=.5) +
+  geom_hline(yintercept = .7, linetype="dashed", linewidth=.5, color="darkgrey")+
+  scale_y_continuous(breaks = seq(0, 1, by = .1))+
+  labs(y="Model performance (AUC-ROC)", x="Spatial scale (m around the stream segment)")+
+  theme(text = element_text(size=7, face="bold"),
+        axis.text.x=element_text(vjust=-.8,  color="black"),
+        axis.text.y=element_text(hjust=.8,  color="black"),
+        axis.title.y = element_text(vjust=.8),
+        axis.title.x = element_text(vjust=-.8),
+        legend.position = "none",
+        axis.ticks = element_line(linewidth = .2, color="grey"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=.05),
+        strip.background = element_rect(color="black", fill=NA, linewidth=.05, linetype="solid"),
+        strip.text.x = element_text(colour = "black", face="bold"),
+        strip.text.y = element_text(colour = "black", face="bold", size=3),
+        plot.margin = margin(2,4,2,2, "mm"))
+
+ggsave(paste0("Fig.sup.scaleroc.pdf"), width = 90, height = 90, units = "mm", dpi=1000)
+
+# GLM Gain vs. feature and scale with taxon as random effect
+tmp <- model.performance.relimp.sel %>%
+    mutate(Feature = factor(Feature, levels=parm.names$Feature)) %>%
+    filter(scale %in% scales.chosen) %>%
+    mutate(scale = as.factor(scale))
+
+# check right-skewedness
+ggplot(tmp, aes(x=Gain)) + 
+  geom_histogram(bins=30, fill="blue", alpha=0.7) + 
+  ggtitle("Histogram of Gain")
+
+# execute test
+Gain.glm <- glmer(Gain ~ Feature * scale + (1|taxon), 
+                data = tmp, 
+                family = Gamma(link = "log"))
+
+# significance per scale + letters for in plot
+Gain.comp.scale.adj <- emmeans(Gain.glm, pairwise ~ Feature | scale, adjust = "holm")
+Gain.comp.scale.unadj <- emmeans(Gain.glm, pairwise ~ Feature | scale, adjust = "none")
+Gain.comp.scale.letters <- NULL
+
+for (s in scales.chosen) {
+  tmp.adj <- summary(Gain.comp.scale.adj$contrasts) %>%
+    filter(scale == s) %>%
+    mutate(Comparison = contrast)
+
+  Gain.comp.scale.letters.adj.tmp <- cldList(p.value ~ Comparison, data = tmp.adj, Letters = LETTERS) %>%
+    rename(Letter_Padj = Letter) %>%
+    rename(Feature = Group) %>%
+    mutate(scale = s)
+
+  tmp.unadj <- summary(Gain.comp.scale.unadj$contrasts) %>%
+    filter(scale == s) %>%
+    mutate(Comparison = contrast)
+  
+  Gain.comp.scale.letters.unadj.tmp <- cldList(p.value ~ Comparison, data = tmp.unadj, Letters = LETTERS) %>%
+    rename(Letter_Punadj = Letter) %>%
+    rename(Feature = Group) %>%
+    mutate(scale = s)
+
+  Gain.comp.scale.letters.tmp <- cbind(select(Gain.comp.scale.letters.adj.tmp, c(4,1,2)),
+                                       select(Gain.comp.scale.letters.unadj.tmp, 2))
+  
+  Gain.comp.scale.letters <- rbind(Gain.comp.scale.letters.tmp, Gain.comp.scale.letters)
+}
+
+Gain.comp.scale.letters <- Gain.comp.scale.letters %>% mutate(scale = as.numeric(scale))
+                                                              
+rm(Gain.comp.scale.letters.tmp, Gain.comp.scale.letters.unadj.tmp, Gain.comp.scale.letters.adj.tmp, 
+   Gain.comp.scale.adj, Gain.comp.scale.unadj, tmp.unadj, tmp.adj)
+
+Gain.comp.total.adj <- emmeans(Gain.glm, pairwise ~ Feature, adjust = "holm")
+Gain.comp.total.unadj <- emmeans(Gain.glm, pairwise ~ Feature, adjust = "none")
+
+tmp.adj <- summary(Gain.comp.total.adj$contrasts) %>%
+    mutate(Comparison = contrast)
+tmp.unadj <- summary(Gain.comp.total.unadj$contrasts) %>%
+    mutate(Comparison = contrast) 
+  
+Gain.comp.total.letters.adj <- cldList(p.value ~ Comparison, data = tmp.adj, Letters = LETTERS) %>%
+    rename(Letter_Padj = Letter) %>%
+    rename(Feature = Group) 
+  
+Gain.comp.total.letters.unadj <- cldList(p.value ~ Comparison, data = tmp.unadj, Letters = LETTERS) %>%
+    rename(Letter_Punadj = Letter) %>%
+    rename(Feature = Group) 
+  
+Gain.comp.total.letters <- cbind(select(Gain.comp.total.letters.adj, c(1,2)),
+                                       select(Gain.comp.total.letters.unadj, 2))
+
+rm(Gain.comp.total.adj, Gain.comp.total.unadj, tmp.adj,tmp.unadj,Gain.comp.total.letters.adj,Gain.comp.total.letters.unadj)
+
+# GLM Gain vs. feature and scale with taxon as random effect plot
+model.performance.relimp.sel %>%
+  filter(model_type=="offset") %>%
+  mutate(Feature = factor(Feature, levels = parm.names$Feature)) %>%
+  ggplot(aes(x=Feature, y=Gain*100, fill=Feature))+
+  stat_boxplot(geom = "errorbar",
+               width = 0.15) + 
+  geom_boxplot(outlier.colour = "grey", outlier.shape = 16, na.rm = TRUE, outlier.size=.5) +
+  geom_text(data = Gain.comp.scale.letters, aes(x=Feature, y=75, label=Letter_Padj), size=2, fontface="bold")+
+  labs(y="Contribution to the prediction of species presence (%)", x="Land use type")+
+  scale_fill_manual(values = c("agri_grass" = "#FFD700", 
+                               "nat_for" = "#006400", 
+                               "urban" = "#808080", 
+                               "agri_cult" = "#FF8C00", 
+                               "nat_shrub_grass" = "#8FBC8F")) +
+  scale_x_discrete(labels=parm.names$Feature.short)+
+  theme(text = element_text(size=7, face="bold"),
+        axis.text.x=element_text(vjust=.3,  color="black", angle=90),
+        axis.text.y=element_text(hjust=.8,  color="black"),
+        axis.title.y = element_text(vjust=.8),
+        axis.title.x = element_text(vjust=-.8),
+        legend.position = "none", 
+        axis.ticks = element_line(linewidth = .2, color="grey"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=.05),
+        strip.background = element_rect(color="black", fill=NA, linewidth=.05, linetype="solid"),
+        strip.text.x = element_text(colour = "black", face="bold"),
+        strip.text.y = element_text(colour = "black", face="bold", size=3),
+        plot.margin = margin(2,4,2,2, "mm"))+
+  facet_wrap(~fct_reorder(paste0(scale, " m around\nthe stream segment"), scale, .desc = F), ncol=4)
+
+ggsave(paste0("Fig.sup.gain_scale.pdf"), width = 140, height = 140, units = "mm", dpi=1000) 
+
+# Fig. 3 Gains vs. land use type and scale
+gain_scale_all <- model.performance.relimp.sel %>%
+  filter(model_type=="offset") %>%
+  mutate(Feature = factor(Feature, levels = parm.names$Feature)) %>%
+  ggplot(aes(x=Feature, y=Gain*100, fill=Feature))+
+  stat_boxplot(geom = "errorbar",
+               width = 0.15) + 
+  geom_boxplot(outlier.colour = "grey", outlier.shape = 16, na.rm = TRUE, outlier.size=.5) +
+  geom_text(data = Gain.comp.total.letters, aes(x=Feature, y=80, label=Letter_Padj), size=2, fontface="bold")+
+  labs(y="Contribution to the prediction\nof species presence (%)", x="Land use type")+
+  scale_fill_manual(values = c("agri_grass" = "#FFD700", 
+                               "nat_for" = "#006400", 
+                               "urban" = "#808080", 
+                               "agri_cult" = "#FF8C00", 
+                               "nat_shrub_grass" = "#8FBC8F")) +
+  scale_x_discrete(labels=parm.names$Feature.short)+
+  ggtitle("a) All land use types") +
+  coord_cartesian(ylim=c(0,80))+
+  theme(text = element_text(size=7, face="bold"),
+        axis.text.x=element_text(vjust=.3,  color="black", angle=90),
+        axis.text.y=element_text(hjust=.8,  color="black"),
+        axis.title.y = element_text(vjust=.8),
+        axis.title.x = element_text(vjust=-.8),
+        legend.position = "none", 
+        plot.title = element_text(hjust=.5),
+        axis.ticks = element_line(linewidth = .2, color="grey"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=.05),
+        strip.background = element_rect(color="black", fill=NA, linewidth=.05, linetype="solid"),
+        strip.text.x = element_text(colour = "black", face="bold"),
+        strip.text.y = element_text(colour = "black", face="bold", size=3),
+        plot.margin = margin(2,4,2,2, "mm"))
+
+nat_for_scale <- model.performance.relimp.sel %>%
+  filter(model_type=="offset") %>%
+  filter(scale %in% scales.chosen) %>% 
+  filter(Feature=="nat_for") %>%
+  ggplot(aes(x=as.factor(scale), y=Gain*100))+
+  stat_boxplot(geom = "errorbar",
+               width = 0.15) + 
+  geom_boxplot(outlier.colour = "grey", outlier.shape = 16, na.rm = TRUE, fill= "#006400", outlier.size=.5) +
+  coord_cartesian(ylim = c(0,80))+
+  ggtitle("b) Forest") +
+  labs(y="Contribution to the prediction\nof species presence (%)", x="Spatial scale (m around the stream segment)")+
+  theme(text = element_text(size=7, face="bold"),
+        axis.text.x=element_text(vjust=.3,  color="black"),
+        axis.text.y=element_text(hjust=.8,  color="black"),
+        axis.title.y = element_text(vjust=.8),
+        axis.title.x = element_text(vjust=-.8),
+        legend.position = "none", 
+        plot.title = element_text(hjust=.5),
+        axis.ticks = element_line(linewidth = .2, color="grey"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=.05),
+        strip.background = element_rect(color="black", fill=NA, linewidth=.05, linetype="solid"),
+        strip.text.x = element_text(colour = "black", face="bold"),
+        strip.text.y = element_text(colour = "black", face="bold", size=3),
+        plot.margin = margin(2,4,2,2, "mm"))
+
+plot_grid(gain_scale_all, nat_for_scale, nrow=2, align = "v")
+ggsave("Fig.3.gain_scale_all.pdf", width = 90, height = 163.6, units = "mm", dpi=1000)  
+
+# GLMM on forest and gain
+model.performance.nat_for.tests <- model.performance.relimp.sel %>%
+  filter(model_type=="offset") %>%
+  filter(scale %in% scales.chosen) %>% 
+  filter(Feature=="nat_for") %>%
+  mutate(scale = as.numeric(as.character(scale))) 
+
+shapiro.test(model.performance.nat_for.tests$Gain)
+hist(model.performance.nat_for.tests$Gain, breaks=30, main="Histogram of Gain")
+qqnorm(model.performance.nat_for.tests$Gain); qqline(model.performance.nat_for.tests$Gain)
+
+model.auc.glm <- model.performance.nat_for.tests %>%
+  glmer(Gain ~ log10(scale) + (1 | taxon), data = ., 
+        family = Gamma(link = "log"))
+
+summary (model.auc.glm)
+slope <- summary(model.auc.glm)
+print("percentage change from 15-500m")
+100 * (exp(fixef(model.auc.glm)["log10(scale)"] * log10(500/15)) - 1)
+exp(slope$coefficients[2,1] * log10(15/max(model.performance.nat_for.tests$scale))) * 100
