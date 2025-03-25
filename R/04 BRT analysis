@@ -1,0 +1,215 @@
+library(beepr)
+library(dplyr)
+library(stats)
+library(caret)
+library(data.table)
+library(janitor)
+library(xgboost)
+library(pdp)
+library(pROC)
+library(twn)
+library(tidyr)
+
+options("scipen"=100, "digits"=7)
+set.seed(12)
+
+# load and prepare data
+all.IDs <- fread(".//data in//mafa.all.IDs.csv") %>% select(-1)
+
+# extract 20 % of the data
+subsample.IDs <- abio.all %>%
+  filter(parameter == "nat.for" & scale == 15) %>%
+  filter(ID %in% mafa.ept.ID) %>%
+  left_join(mafa.all.IDs, by = "ID") %>%
+  filter(year > 2009) %>%
+  group_by(ID) %>%
+  mutate(lu.cat = case_when(value <= .25 ~ "cat25",
+                            value > .25 & value <= .50 ~ "cat50",
+                            value > .50 & value <= .75 ~ "cat75",
+                            value > .75 ~ "cat100")) %>%
+  ungroup() %>%
+  sample_frac(.2)
+
+fwrite(subsample.IDs[,1], "subsample.IDs.csv")
+
+# abio per sampling site
+abio.all.loc <- abio.all %>%
+  select(2:5) %>%
+  droplevels() %>% 
+  unique() %>%
+  mutate(scale = as.numeric(scale))
+
+abio.all.loc.ids <- unique(abio.all.loc$ID.loc)
+
+# ept per sample to ept per site
+mafa.ept <- fread(".//data in//mafa.ept.csv") %>%
+  filter(!ID %in% subsample.IDs$ID) %>%
+  mutate(level = twn_taxonlevel(Taxon),
+         ordo = increase_taxonlevel(Taxon, "Ordo"))
+
+mafa.ept.loc <- mafa.ept %>% 
+  filter(year>2009) %>%
+  left_join(all.IDs[,c(1,6)]) %>%
+  group_by(ID.loc, Taxon, ordo, RD_x, RD_y) %>%
+  filter(ID.loc %in% unique(abio.all.loc$ID.loc)) %>%
+  summarise(waarde=sum(Waarde),
+            occ.abs=length(Waarde[Waarde>0]),
+            sites=length(ID.loc)) %>%
+  mutate(occ.rel=occ.abs/sites) %>%
+  ungroup()
+
+mafa.ept.loc$waardebin <- case_when(mafa.ept.loc$waarde>0 ~ 1,
+                                    mafa.ept.loc$waarde==0 ~ 0)
+
+# filter out sites without samples
+abio.all.loc <- abio.all.loc %>% filter(ID.loc %in% mafa.ept.loc$ID.loc) 
+
+# select taxa
+taxon.to.test <- mafa.ept.loc %>% 
+  group_by(Taxon, ordo) %>% 
+  summarise(count=length(unique(ID.loc[waarde>0]))) %>% 
+  filter(count>24)
+
+# Initialize data frames to store model performance 
+model.performance <- data.frame()
+model.performance.relimp <- data.frame()
+model.performance.pdp <- data.frame()
+beeps <- 0
+
+# xgboost settings 
+eta.setting <- 0.1
+max_depth.setting <- 6
+nround.setting <- 25
+subsample.setting <- 0.5
+colsample_bytree.setting <- 0.5
+eval_metric.setting <- "auc"
+objective.setting <- "binary:logistic"
+nthread.setting <- 3
+verbose.setting <- 2
+
+for (i in unique(taxon.to.test$Taxon)) {
+  mafa.ept.taxon.base <- mafa.ept.loc %>% 
+   filter(Taxon == i)  
+  print(i) 
+  
+  for (j in unique(abio.all.loc$scale)) {
+    
+    # Filter abiotic data and merge with macroinvertebrate data
+    abio.tmp <- abio.all.loc %>% 
+      filter(scale == j) %>% 
+      pivot_wider(id_cols = ID.loc, names_from = parameter, values_from = value)
+    
+    mafa.ept.taxon <- mafa.ept.taxon.base[, c(1,4,5, 10)] %>% 
+      left_join(abio.tmp, by = "ID.loc") %>%
+      ungroup() %>%
+      select(-ID.loc)
+    mafa.ept.taxon <- mafa.ept.taxon %>%
+      clean_names()
+    
+    # Split into training and test data, but make sure both sets contain positive observations
+    valid_partition=FALSE
+    
+    while (!valid_partition) {
+      # Create partition
+      trainindex <- createDataPartition(mafa.ept.taxon$waardebin, p = 0.8, list = FALSE, times = 1)
+      
+      # Split data into training and testing sets
+      mafa.ept.taxon.train <- mafa.ept.taxon[trainindex, ]
+      mafa.ept.taxon.test <- mafa.ept.taxon[-trainindex, ]
+      
+      # Check if both training and testing sets contain waardebin = 0
+      if (sum(mafa.ept.taxon.train$waardebin) == 0 & sum(mafa.ept.taxon.test$waardebin) == 0) {
+        valid_partition <- FALSE
+      } else {valid_partition <- TRUE}
+    }
+    
+    # Fit offset model with slope and coordinates
+    initial_matrix <- as.matrix(mafa.ept.taxon.train %>% select(elev_slope, rd_x, rd_y))
+    initial_dmatrix <- xgb.DMatrix(data = initial_matrix, label = mafa.ept.taxon.train$waardebin, missing = NA)
+    
+    initial_model <- xgboost(
+      data = initial_dmatrix,
+      eta = eta.setting,
+      max_depth = max_depth.setting,
+      nround = nround.setting,
+      subsample = subsample.setting,
+      colsample_bytree = colsample_bytree.setting,
+      eval_metric = eval_metric.setting,
+      objective = objective.setting,
+      nthread = nthread.setting,
+      verbose = verbose.setting
+    )
+    
+    # Get predictions from the initial model to use as offsets
+    initial_preds <- predict(initial_model, xgb.DMatrix(data = as.matrix(mafa.ept.taxon.train %>% select(elev_slope, rd_x, rd_y))))
+    
+    # Create the main model matrix with other predictors (excluding elev_slope and id_loc)
+    main_matrix <- as.matrix(mafa.ept.taxon.train %>% select(-c(elev_slope, rd_x, rd_y, waardebin)))
+    main_dmatrix <- xgb.DMatrix(data = main_matrix, label = mafa.ept.taxon.train$waardebin, base_margin = initial_preds, missing = NA)
+    
+    # Fit the main model with the offsets
+    main_model <- xgboost(
+      data = main_dmatrix,
+      eta = eta.setting,
+      max_depth = max_depth.setting,
+      nround = nround.setting,
+      subsample = subsample.setting,
+      colsample_bytree = colsample_bytree.setting,
+      eval_metric = eval_metric.setting,
+      objective = objective.setting,
+      nthread = nthread.setting,
+      verbose = verbose.setting
+    )
+    
+    # Validate the main model
+    main_preds <- predict(main_model, xgb.DMatrix(data = as.matrix(mafa.ept.taxon.test %>% select(-c(elev_slope, rd_x, rd_y, waardebin))), 
+                                                  base_margin = predict(initial_model, xgb.DMatrix(data = as.matrix(mafa.ept.taxon.test %>% select(elev_slope, rd_x, rd_y))))))
+    main_auc <- roc(mafa.ept.taxon.test$waardebin, main_preds)$auc
+    main_rmse <- sqrt(mean((mafa.ept.taxon.test$waardebin - main_preds)^2))
+    main_r2 <- cor(mafa.ept.taxon.test$waardebin, main_preds, method = "spearman")^2
+    
+    # Store performance metrics in the data frame
+    performance <- data.frame(
+      auc_offset = main_auc,
+      rmse_offset = main_rmse,
+      R2_offset = main_r2,
+      scale = j,
+      taxon = i
+    )
+    
+    model.performance <- rbind(model.performance, performance)
+    
+    # Store relative importance for the main model
+    relimp_main <- xgb.importance(model = main_model)
+    relimp_main$scale <- j
+    relimp_main$taxon <- i
+    relimp_main$model_type <- "offset"
+    model.performance.relimp <- rbind(model.performance.relimp, relimp_main)
+    
+    # Generate partial dependence plots for the main model
+    for (k in names(select(mafa.ept.taxon.train, -c(elev_slope, rd_x, rd_y, waardebin)))) {
+      pdp_main <- partial(main_model, pred.var = k, 
+                          train = as.matrix(select(mafa.ept.taxon.train, -c(elev_slope, rd_x, rd_y, waardebin))), 
+                          grid.resolution = 50)
+      
+      pdp_main$parameter <- k
+      pdp_main$scale <- j
+      pdp_main$taxon <- i
+      pdp_main$model_type <- "offset"
+      names(pdp_main)[1] <- "value"
+      
+      model.performance.pdp <- rbind(model.performance.pdp, pdp_main)
+    }
+  }
+}
+
+model.performance.pdp$yhat.prob <- (1/(1+exp(-model.performance.pdp$yhat)))
+
+fwrite(model.performance, paste0("model.performance_",Sys.Date(), ".csv"))
+model.performance <- fread(paste0("model.performance_",Sys.Date(), ".csv"))
+
+fwrite(model.performance.relimp, paste0("model.performance.relimp_",Sys.Date(), ".csv"))
+model.performance.relimp <- fread(paste0("model.performance.relimp_",Sys.Date(), ".csv"))
+
+fwrite(model.performance.pdp, paste0("model.performance.pdp_",Sys.Date(), ".csv"))
+model.performance.pdp <- fread(paste0("model.performance.pdp_",Sys.Date(), ".csv"))
