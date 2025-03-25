@@ -1,0 +1,45 @@
+library(tidyr)
+library(dplyr)
+library(sf)
+library(sp)
+library(geos)
+library(raster)
+library(terra)
+library(tidyterra)
+library(ggplot2)
+library(units)
+library(data.table)
+library(twn)
+
+Streams50m <- vect("../GIS/DutchStreams add on/DutchStreamsFull_50m.shp")  # streams cut in 50 m segments, done in QGIS
+Mafa.full <- fread("Total.MF.cleanmerge.20231123.csv") %>% select(-1) # read all macroinvertebrate sampling data
+
+Mafa.full.mp <- Mafa.full %>% group_by(ID, RD_x, RD_y, KRW, Datum, year) %>% summarise(TaxaCount=length(unique(Taxon))) # extract only sampling sites
+Mafa.full.mp <- vect(Mafa.full.mp, geom=c("RD_x", "RD_y"), crs="+init=epsg:28992")
+
+Mafa.streams.mp <- terra::intersect(Mafa.full.mp, Streams50m) # checke welke in de beken liggen
+#Mafa.streams.mp0 <- filter(Mafa.streams.mp, is.na(fid))
+Mafa.streams.mp <- terra::intersect(Mafa.streams.mp, Districts_merged.big) 
+Mafa.streams.mp <- terra::as.data.frame(Mafa.streams.mp, geom="XY") 
+
+Mafa.streams.mp <- Mafa.streams.mp %>%
+  mutate(fid = case_when(
+    startsWith(KRW, "M") ~ NA,
+    TRUE ~ 1)) %>% filter(fid==1)
+
+Mafa.streams.mp <- Mafa.streams.mp %>% 
+  filter(fid==1) %>% 
+  filter(merge==1) 
+
+Mafa.streams.mp <- Mafa.streams.mp %>% select(c(1:5, 35,36))
+         
+Mafa.streams.mp.loc <- Mafa.streams.mp %>% group_by(x, y) %>% summarize(ID.loc = 1)
+Mafa.streams.mp.loc$ID.loc <- Mafa.streams.mp.loc %>% row_number()
+
+Mafa.streams.mp <- Mafa.streams.mp %>% dplyr::left_join(Mafa.streams.mp.loc)
+names(Mafa.streams.mp)[6] <- "RD_x"
+names(Mafa.streams.mp)[7] <- "RD_y"
+
+fwrite(Mafa.streams.mp, "Mafa.streams.mp1999.csv")
+
+mafa.streams.mp1999 <- vect(Mafa.streams.mp, geom=c("RD_x", "RD_y"), crs="+init=epsg:28992")
