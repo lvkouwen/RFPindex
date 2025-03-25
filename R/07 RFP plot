@@ -1,1 +1,128 @@
+library(rmarkdown)
+library(janitor)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(data.table)
+library(twn)
+library(segmented)
+library(ggridges)
+library(ggpubr)
 
+# data and constants
+model.performance <- fread(paste0(".//data in//model.performance.csv"))
+model.performance.relimp <- fread(paste0(".//data in//model.performance.relimp.csv"))
+model.performance.pdp <- fread(paste0(".//data in//model.performance.pdp.csv"))
+
+Gain_dir <- fread(".//Gain_dir.csv")
+Gain_dir.sel.def <- fread(".//Gain_dir.sel.def.csv")
+
+# plot
+s <- 15
+p <- "nat_for"
+text.size <- 2
+labels.size <- 6
+
+Gain_dir.sel.def.for <- Gain_dir.sel.def %>%
+  filter(parameter==p)
+
+grob_y_labels2 <- Gain_dir.sel.def.for %>%
+  mutate(taxon = paste0(taxon, " (", substring(orde, 1, 1), ")")) %>%
+  ggplot(aes(y = fct_reorder(taxon, FPI_raw, .desc = F), x = 1)) +
+  theme_void() + 
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),  
+    axis.text.y = element_text(size = labels.size, hjust = 1, face="italic"), 
+    plot.margin = margin(.1, 0, .1, .3, "cm")  
+  )
+
+grob_y_labels2 <- ggplotGrob(grob_y_labels2)
+
+plot.weighted2 <- 
+  Gain_dir.sel.def.for %>%
+  ggplot(aes(x = parameter, 
+             y = fct_reorder(taxon, FPI_raw, .desc = F), 
+             fill = after_stat(Gain_dir.sel.def.for$FPI_raw))) +
+  labs(y = "", x = "") +
+  geom_tile(colour="darkgrey", width=1) +
+  geom_text(aes(label = sprintf("%.2f", FPI_raw)),  # Use sprintf for fixed decimal places
+            size = text.size, color = "black",
+            fontface="bold") +
+  scale_fill_gradient2(name = "",
+                       low = "red",
+                        high = "green",
+                       # #limits = c(-100, 100),
+                        midpoint = 0,
+                       na.value = "00FFFFFF") +
+  scale_x_discrete(position = "top", labels = "c)\nRiparian forest\npreference\n(RFPspec)", expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(hjust = .5, size=labels.size, vjust=0, face = "bold"),
+        axis.text.y = element_blank(),
+        legend.text = element_text(size = labels.size),
+        panel.grid = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        axis.title = element_text(size = labels.size),
+        strip.text = element_blank(),
+        strip.background = element_blank(),
+        plot.margin = margin(-1, .1, .1, -.15, "cm")) 
+
+plot.estimate2 <- Gain_dir.sel.def.for %>%
+  ggplot(aes(x = parameter, 
+             y = fct_reorder(taxon, FPI_raw, .desc = F), 
+             fill = after_stat(Gain_dir.sel.def.for$tot.estimate))) +
+  labs(y = "", x = "") +
+  geom_tile(colour="darkgrey", width=1) +
+  geom_text(aes(label = sprintf("%.2f", tot.estimate*100)),  #
+            size = text.size, color = "black", fontface="italic") +
+  scale_fill_gradient2(name = "",
+                       low = "red",
+                       high = "green",
+                       #limits = c(-100, 100),
+                       midpoint = 0,
+                       na.value = "00FFFFFF") +
+  scale_x_discrete(position = "top",  labels = "a)\nForest response\nintensity\n", 
+                   expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(hjust = .5, size=labels.size, vjust=0, face = "bold"),
+        axis.text.y = element_blank(),
+        legend.text = element_text(size = labels.size),
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "none",
+        axis.title = element_text(size = labels.size),
+        strip.text = element_blank(),
+        strip.background = element_blank(),
+        plot.margin = margin(-1, 0, .1, -.15, "cm")) 
+
+plot.bp.sat2 <-Gain_dir.sel.def.for %>%
+  ggplot(aes(x = parameter, 
+             y = fct_reorder(taxon, FPI_raw, .desc = F), 
+             fill = after_stat(Gain_dir.sel.def.for$bp.sat))) +
+  labs(y = "", x = "") +
+  geom_tile(colour="darkgrey", width=1) +
+  geom_text(aes(label = sprintf("%.0f", bp.sat*100)),  # Use sprintf for fixed decimal places
+            size = text.size, color = "black", fontface="italic") +
+  scale_fill_gradient2(name = "",
+                       low = "red",
+                       high = "green",
+                       limits = c(-1, 1),
+                       midpoint = 0,
+                       na.value = "00FFFFFF") +
+  scale_x_discrete(position = "top", labels = "b)\nForest cover\nthreshold (%)\n", expand = c(0, 0)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(hjust = .5, size=labels.size, vjust=0, face = "bold"),
+        axis.text.y = element_blank(),
+        legend.text = element_text(size = labels.size),
+        panel.grid = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        axis.title = element_text(size = labels.size),
+        strip.text = element_blank(),
+        strip.background = element_blank(),
+        plot.margin = margin(-1, 0, .1, -.15, "cm")) 
+ 
+ggarrange(grob_y_labels2, plot.estimate2, plot.bp.sat2, plot.weighted2,align = "h", widths=c(.9,.5,.5,.5), ncol = 4)
+
+ggsave("Fig.4.Slope.breakpoint.nat_for.pdf", width = 90, height = 150, units = "mm", dpi=1000)
