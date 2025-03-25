@@ -1,0 +1,66 @@
+library(tidyr)
+library(dplyr)
+library(sf)
+library(sp)
+library(geos)
+library(raster)
+library(stats)
+library(terra)
+library(tidyterra)
+library(ggplot2)
+library(units)
+
+options("scipen"=100, "digits"=7)
+
+# load all sampling sites and dutch streams
+mafa.streams.mp1999.sites <- read.csv("Mafa.streams.mp1999.csv") # all sites
+mafa.streams.mp1999 <- st_as_sf(vect(mafa.streams.mp1999.sites, geom=c("RD_x", "RD_y"), crs="+init=epsg:28992")) # vectorize
+mafa.streams.locations <- mafa.streams.mp1999.sites %>% 
+  select(ID.loc, RD_x, RD_y) %>% unique() # remove duplicates
+mafa.streams.locations <- st_as_sf(vect(mafa.streams.locations, geom=c("RD_x", "RD_y"), crs="+init=epsg:28992")) # vectorize again
+
+mafa.segments <- st_read(".//segment shapes//ID.loc.segments.shp") # 250 m stream segments
+
+# loop to create buffers around each segment
+distances <- c(15,25,50,75,100,150,250,500,750)
+for (d in distances) {
+  
+  mafa.streams.section.buff <- NULL
+  mafa.streams.section.buff <- mafa.segments %>%
+    st_buffer(dist = d, capstyle = "round") %>% 
+    st_as_sf()
+  
+  st_write(mafa.streams.section.buff, paste0("ID.loc.buffer.",d,"m.shp"))
+}
+
+# Add scale column and merge
+ID.loc.buffer.15m <- st_as_sf(vect("./segment shapes/ID.loc.buffer.15m.shp")) %>% mutate(scale = 15)
+ID.loc.buffer.25m <- st_as_sf(vect("./segment shapes/ID.loc.buffer.25m.shp")) %>% mutate(scale = 25)
+ID.loc.buffer.50m <- st_as_sf(vect("./segment shapes/ID.loc.buffer.50m.shp")) %>% mutate(scale = 50)
+ID.loc.buffer.75m <- st_as_sf(vect("./segment shapes/ID.loc.buffer.75m.shp")) %>% mutate(scale = 75)
+ID.loc.buffer.100m <- st_as_sf(vect("./segment shapes/ID.loc.buffer.100m.shp")) %>% mutate(scale = 100)
+ID.loc.buffer.150m <- st_as_sf(vect("./segment shapes/ID.loc.buffer.150m.shp")) %>% mutate(scale = 150)
+ID.loc.buffer.250m <- st_as_sf(vect("./segment shapes/ID.loc.buffer.250m.shp")) %>% mutate(scale = 250)
+ID.loc.buffer.500m <- st_as_sf(vect("./segment shapes/ID.loc.buffer.500m.shp")) %>% mutate(scale = 500)
+
+# Merge all data frames into one
+ID.loc.buffer <- bind_rows(
+  ID.loc.buffer.15m, 
+  ID.loc.buffer.25m, 
+  ID.loc.buffer.50m, 
+  ID.loc.buffer.75m, 
+  ID.loc.buffer.100m, 
+  ID.loc.buffer.150m, 
+  ID.loc.buffer.250m, 
+  ID.loc.buffer.500m, 
+  ID.loc.buffer.750m, 
+  ID.loc.buffer.1000m, 
+  ID.loc.buffer.1500m,
+  ID.loc.buffer.2500m,
+  ID.loc.buffer.5000m,
+  ID.loc.buffer.7500m
+)
+
+ID.loc.buffer$rownum <- row.names(ID.loc.buffer)
+st_write(ID.loc.buffer, "./segment shapes/ID.loc.buffer.shp")
+
